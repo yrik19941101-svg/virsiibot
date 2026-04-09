@@ -1,0 +1,10 @@
+{
+    "telegram_token": "8093415509:AAEPSOvKNTKRhCEYo1uzYiTv04DvAnhzyGQ",
+    "telegram_chat_id": "354290076",
+    "exchange": "bingx",
+    "timeframe": "4h",
+    "min_body_ratio": 0.3,
+    "initial_lot": 0.1,
+    "max_martingale_steps": 3,
+    "logging": true
+}
