@@ -1,0 +1,18 @@
+{
+    "telegram_token": "8792679531:AAFqpcSduf_9bPY44hYU3CAkNjpMovIRGjw",
+    "telegram_chat_id": "354290076",
+    "exchange": "bingx",
+    "timeframe": "1h",
+    "symbols": [
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+        "DOGE/USDT", "ADA/USDT", "TRX/USDT", "AVAX/USDT", "DOT/USDT",
+        "LINK/USDT", "MATIC/USDT", "UNI/USDT", "ATOM/USDT", "LTC/USDT",
+        "ETC/USDT", "FIL/USDT", "APT/USDT", "ARB/USDT", "OP/USDT",
+        "NEAR/USDT", "INJ/USDT", "SUI/USDT", "SEI/USDT", "TIA/USDT",
+        "WLD/USDT", "PEPE/USDT", "FLOKI/USDT", "BONK/USDT", "ORDI/USDT",
+        "1000SATS/USDT", "RNDR/USDT", "GRT/USDT", "AAVE/USDT", "MKR/USDT",
+        "CRV/USDT", "SNX/USDT", "COMP/USDT", "ZEC/USDT", "DASH/USDT",
+        "XTZ/USDT", "ALGO/USDT", "VET/USDT", "THETA/USDT", "FTM/USDT",
+        "SAND/USDT", "MANA/USDT", "GALA/USDT", "AXS/USDT", "FLOW/USDT"
+    ]
+}
