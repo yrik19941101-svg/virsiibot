@@ -1,0 +1,12 @@
+{
+    "telegram_token": "8093415509:AAFGdZDhy3EBtiRpmYIk9_EPecP4Gd4PCwQ",
+    "telegram_chat_id": "354290076",
+    "exchange": "bingx",
+    "timeframe": "1h",
+    "symbols": [
+        "TRIA-USDT", "EDGEX-USDT", "XPL-USDT", "PRL-USDT",
+        "SIREN-USDT", "ENA-USDT", "AVAX-USDT", "1000PEPE-USDT",
+        "TRUMP-USDT", "ONDO-USDT", "BLUR-USDT", "VIRTUAL-USDT",
+        "XPIN-USDT", "BEA-USDT", "CLO-USDT"
+    ]
+}
