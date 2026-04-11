@@ -30,7 +30,7 @@ class TradingBot:
         self.next_trade_doubled = False
         self.open_positions = set()
         self.pos_data = {}
-        self.all_symbols = []
+        self.all_symbols = self.config['symbols']
         self.signal_state = {}
         self.telegram_bot = Bot(token=config["telegram_token"])
 
@@ -50,9 +50,7 @@ class TradingBot:
 
     async def load_markets(self):
         await self.exchange.load_markets()
-        all_swap = [s for s, m in self.exchange.markets.items() if m['swap'] and m['quote'] == 'USDT']
-        self.all_symbols = all_swap
-        logger.info(f"Загружено {len(self.all_symbols)} фьючерсных пар")
+        logger.info(f"Загружено рынков, используем {len(self.all_symbols)} указанных пар")
         logger.info(f"Таймфрейм: {self.config['timeframe']}")
 
     def get_trade_amount(self):
@@ -60,7 +58,6 @@ class TradingBot:
         return base * 2 if self.next_trade_doubled else base
 
     async def set_leverage(self, symbol, leverage):
-        """Установка плеча для MEXC (через params, так как set_leverage может требовать positionId)"""
         try:
             await self.exchange.set_leverage(leverage, symbol)
             logger.info(f"Плечо {leverage}x для {symbol}")
@@ -83,14 +80,6 @@ class TradingBot:
         try:
             await self.set_leverage(symbol, leverage)
 
-            order = await self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side=side,
-                amount=quantity
-            )
-            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
-
             sl_percent = self.config['trade_params']['sl_percent']
             tp_percent = self.config['trade_params']['tp_percent']
             if direction == 'LONG':
@@ -99,6 +88,17 @@ class TradingBot:
             else:
                 stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
                 take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
+
+            # Открываем рыночный ордер без TP/SL (полагаемся на мониторинг)
+            order = await self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=side,
+                amount=quantity
+            )
+            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
+            logger.info(f"Стоп-лосс: {stop_price:.5f} (изменение {abs(stop_price/price - 1)*100:.2f}%)")
+            logger.info(f"Тейк-профит: {take_price:.5f} (изменение {abs(take_price/price - 1)*100:.2f}%)")
 
             self.open_positions.add(symbol)
             self.pos_data[symbol] = {
@@ -111,8 +111,6 @@ class TradingBot:
                 'leverage': leverage,
                 'closed': False
             }
-            logger.info(f"Стоп-лосс: {stop_price:.5f} (изменение {abs(stop_price/price - 1)*100:.2f}%)")
-            logger.info(f"Тейк-профит: {take_price:.5f} (изменение {abs(take_price/price - 1)*100:.2f}%)")
 
             balance = await self.get_balance()
             emoji = "🟢" if direction == 'LONG' else "🔴"
@@ -279,7 +277,7 @@ class TradingBot:
         await self.load_markets()
         asyncio.create_task(self.monitor_positions())
         balance = await self.get_balance()
-        await self.send_telegram(f"🚀 Бот запущен (MEXC)\nТаймфрейм: 30m\nСумма сделки: 4 USDT\nSL: 25%, TP: 25%\nМартингейл: удвоение после стоп-лосса\nБаланс: {balance:.2f} USDT")
+        await self.send_telegram(f"🚀 Бот запущен (MEXC, только указанные пары)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nSL: 50%, TP: 50%\nМартингейл: удвоение после стоп-лосса\nБаланс: {balance:.2f} USDT")
         while True:
             for symbol in self.all_symbols:
                 try:
