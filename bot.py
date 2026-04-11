@@ -51,7 +51,7 @@ class TradingBot:
     async def load_markets(self):
         await self.exchange.load_markets()
         logger.info(f"Загружено рынков, используем {len(self.all_symbols)} указанных пар")
-        logger.info(f"Таймфрейм: {self.config['timeframe']}")
+        logger.info(f"Таймфрейм: {self.config['timeframe']}, плечо: {self.config['trade_params']['default_leverage']}x")
 
     def get_trade_amount(self):
         base = self.config['trade_params']['fixed_trade_amount']
@@ -72,10 +72,15 @@ class TradingBot:
         trade_amount = self.get_trade_amount()
         leverage = self.config['trade_params']['default_leverage']
         side = 'buy' if direction == 'LONG' else 'sell'
-        quantity = round((trade_amount * leverage) / price, 5)
+        # Количество контрактов = (сумма в USDT * плечо) / цена
+        quantity = (trade_amount * leverage) / price
+        # Округляем до 5 знаков (CCXT сам подстроит под шаг биржи)
+        quantity = round(quantity, 5)
         if quantity <= 0:
-            logger.error(f"Неверное количество {symbol}: {quantity}")
+            logger.error(f"Неверное количество {symbol}: {quantity}, цена={price}, сумма={trade_amount}, плечо={leverage}")
             return
+
+        logger.info(f"Расчёт: сумма {trade_amount} USDT, плечо {leverage}, цена {price} → количество {quantity}")
 
         try:
             await self.set_leverage(symbol, leverage)
@@ -89,7 +94,7 @@ class TradingBot:
                 stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
                 take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
 
-            # Открываем рыночный ордер без TP/SL (полагаемся на мониторинг)
+            # Открываем рыночный ордер (без TP/SL, полагаемся на мониторинг)
             order = await self.exchange.create_order(
                 symbol=symbol,
                 type='market',
@@ -109,7 +114,9 @@ class TradingBot:
                 'take_price': take_price,
                 'trade_amount': trade_amount,
                 'leverage': leverage,
-                'closed': False
+                'closed': False,
+                'trailing_activated': False,
+                'breakeven_stop': None
             }
 
             balance = await self.get_balance()
@@ -119,6 +126,7 @@ class TradingBot:
                    f"Цена: {price:.5f}\n"
                    f"Сумма: {trade_amount:.2f} USDT\n"
                    f"Плечо: {leverage}x\n"
+                   f"Количество: {quantity:.5f}\n"
                    f"SL: {stop_price:.5f} ({sl_percent*100:.0f}%)\n"
                    f"TP: {take_price:.5f} ({tp_percent*100:.0f}%)\n"
                    f"Баланс: {balance:.2f} USDT")
@@ -175,20 +183,42 @@ class TradingBot:
                     current_price = ticker['last']
                     should_close = False
                     reason = None
-                    if pos['direction'] == 'LONG':
-                        if current_price <= pos['stop_price']:
+
+                    # Трейлинг-стоп (безубыток после 50% TP)
+                    tp_percent = self.config['trade_params']['tp_percent']
+                    activation = self.config['trade_params'].get('trailing_stop_activation', 0.5)
+                    if not pos.get('trailing_activated'):
+                        profit_percent = (current_price - pos['entry_price']) / pos['entry_price'] if pos['direction'] == 'LONG' else (pos['entry_price'] - current_price) / pos['entry_price']
+                        if profit_percent >= tp_percent * activation:
+                            pos['trailing_activated'] = True
+                            pos['breakeven_stop'] = pos['entry_price']
+                            logger.info(f"{symbol}: активирован безубыток на {pos['entry_price']}")
+                            await self.send_telegram(f"🔒 {symbol}: трейлинг-стоп активирован, стоп на {pos['entry_price']:.5f}")
+
+                    if pos.get('trailing_activated') and pos['breakeven_stop']:
+                        if pos['direction'] == 'LONG' and current_price <= pos['breakeven_stop']:
                             should_close = True
-                            reason = 'stop_loss'
-                        elif current_price >= pos['take_price']:
+                            reason = 'trailing_stop'
+                        elif pos['direction'] == 'SHORT' and current_price >= pos['breakeven_stop']:
                             should_close = True
-                            reason = 'take_profit'
-                    else:
-                        if current_price >= pos['stop_price']:
-                            should_close = True
-                            reason = 'stop_loss'
-                        elif current_price <= pos['take_price']:
-                            should_close = True
-                            reason = 'take_profit'
+                            reason = 'trailing_stop'
+
+                    if not should_close:
+                        if pos['direction'] == 'LONG':
+                            if current_price <= pos['stop_price']:
+                                should_close = True
+                                reason = 'stop_loss'
+                            elif current_price >= pos['take_price']:
+                                should_close = True
+                                reason = 'take_profit'
+                        else:
+                            if current_price >= pos['stop_price']:
+                                should_close = True
+                                reason = 'stop_loss'
+                            elif current_price <= pos['take_price']:
+                                should_close = True
+                                reason = 'take_profit'
+
                     if should_close:
                         await self.close_position(symbol, reason, current_price)
                 except Exception as e:
@@ -277,7 +307,7 @@ class TradingBot:
         await self.load_markets()
         asyncio.create_task(self.monitor_positions())
         balance = await self.get_balance()
-        await self.send_telegram(f"🚀 Бот запущен (MEXC, только указанные пары)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nSL: 50%, TP: 50%\nМартингейл: удвоение после стоп-лосса\nБаланс: {balance:.2f} USDT")
+        await self.send_telegram(f"🚀 Бот запущен (MEXC)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nПлечо: 50x\nSL: 50%, TP: 50%\nМартингейл: удвоение после стоп-лосса\nТрейлинг-стоп: после 50% TP\nБаланс: {balance:.2f} USDT")
         while True:
             for symbol in self.all_symbols:
                 try:
