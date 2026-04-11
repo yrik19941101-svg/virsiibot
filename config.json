@@ -16,7 +16,7 @@
         "trailing_stop_activation": 0.5
     },
     "symbols": [
-        "TRUMP/USDT", "SIREN/USDT", "JCT/USDT", "LYN/USDT",
+       "TRUMP/USDT", "SIREN/USDT", "JCT/USDT", "LYN/USDT",
         "ETH/USDT", "GOLD(XAUT)/USDT", "SOL/USDT", "SILVER(XAG)/USDT",
         "OIL(WTI)/USDT", "OIL(PRENT)/USDT", "TAO/USDT", "POWER/USDT",
         "ZEC/USDT", "RIVER/USDT", "XRP/USDT", "DASH/USDT",
