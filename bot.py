@@ -2,9 +2,9 @@ import asyncio
 import logging
 import ccxt.async_support as ccxt
 import pandas as pd
-from telegram import Bot
 import json
 from datetime import datetime
+from telegram import Bot
 
 CONFIG_FILE = "config.json"
 
@@ -15,30 +15,189 @@ def load_config():
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class HeikenAshiBot:
+class TradingBot:
     def __init__(self, config):
         self.config = config
         self.exchange = getattr(ccxt, config["exchange"])({
             'enableRateLimit': True,
+            'apiKey': config['api_key'],
+            'secret': config['api_secret'],
             'options': {
-                'defaultType': 'swap'  # обязательно для фьючерсов BingX
+                'defaultType': 'swap',
+                'adjustForTimeDifference': True
             }
         })
-        self.state = {}
+        self.next_trade_doubled = False
+        self.open_positions = set()
+        self.pos_data = {}
+        self.all_symbols = []
+        self.signal_state = {}
+        self.telegram_bot = Bot(token=config["telegram_token"])
 
-    async def load_symbols(self):
-        self.all_symbols = self.config['symbols']
-        bot = Bot(token=self.config["telegram_token"])
-        await bot.send_message(
-            chat_id=self.config["telegram_chat_id"],
-            text=f"✅ Бот запущен (BingX фьючерсы, {len(self.all_symbols)} монет)\n"
-                 f"Таймфрейм: {self.config['timeframe']}\n\n"
-                 f"_Стратегия: смена цвета HA → откат → сигнал_",
-            parse_mode='Markdown'
-        )
+    async def get_balance(self):
+        try:
+            balance = await self.exchange.fetch_balance()
+            return balance['USDT']['free']
+        except Exception as e:
+            logger.error(f"Ошибка баланса: {e}")
+            return 0.0
 
-    @staticmethod
-    def calculate_heiken_ashi(df):
+    async def send_telegram(self, message):
+        try:
+            await self.telegram_bot.send_message(chat_id=self.config["telegram_chat_id"], text=message, parse_mode=None)
+        except Exception as e:
+            logger.error(f"Ошибка Telegram: {e}")
+
+    async def load_markets(self):
+        await self.exchange.load_markets()
+        all_swap = [s for s, m in self.exchange.markets.items() if m['swap'] and m['quote'] == 'USDT']
+        self.all_symbols = all_swap
+        logger.info(f"Загружено {len(self.all_symbols)} фьючерсных пар")
+        logger.info(f"Таймфрейм: {self.config['timeframe']}")
+
+    def get_trade_amount(self):
+        base = self.config['trade_params']['fixed_trade_amount']
+        return base * 2 if self.next_trade_doubled else base
+
+    async def set_leverage(self, symbol, leverage):
+        """Установка плеча для MEXC (через params, так как set_leverage может требовать positionId)"""
+        try:
+            await self.exchange.set_leverage(leverage, symbol)
+            logger.info(f"Плечо {leverage}x для {symbol}")
+        except Exception as e:
+            logger.error(f"Ошибка установки плеча {symbol}: {e}")
+
+    async def open_position(self, symbol, direction, price, volume):
+        if len(self.open_positions) >= self.config['max_positions']:
+            logger.warning(f"Лимит позиций ({self.config['max_positions']}) достигнут, пропускаем {symbol}")
+            return
+
+        trade_amount = self.get_trade_amount()
+        leverage = self.config['trade_params']['default_leverage']
+        side = 'buy' if direction == 'LONG' else 'sell'
+        quantity = round((trade_amount * leverage) / price, 5)
+        if quantity <= 0:
+            logger.error(f"Неверное количество {symbol}: {quantity}")
+            return
+
+        try:
+            await self.set_leverage(symbol, leverage)
+
+            order = await self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=side,
+                amount=quantity
+            )
+            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
+
+            sl_percent = self.config['trade_params']['sl_percent']
+            tp_percent = self.config['trade_params']['tp_percent']
+            if direction == 'LONG':
+                stop_price = round(price * (1 - (1/leverage) * sl_percent), 5)
+                take_price = round(price * (1 + (1/leverage) * tp_percent), 5)
+            else:
+                stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
+                take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
+
+            self.open_positions.add(symbol)
+            self.pos_data[symbol] = {
+                'direction': direction,
+                'entry_price': price,
+                'quantity': quantity,
+                'stop_price': stop_price,
+                'take_price': take_price,
+                'trade_amount': trade_amount,
+                'leverage': leverage,
+                'closed': False
+            }
+            logger.info(f"Стоп-лосс: {stop_price:.5f} (изменение {abs(stop_price/price - 1)*100:.2f}%)")
+            logger.info(f"Тейк-профит: {take_price:.5f} (изменение {abs(take_price/price - 1)*100:.2f}%)")
+
+            balance = await self.get_balance()
+            emoji = "🟢" if direction == 'LONG' else "🔴"
+            msg = (f"{emoji} ОТКРЫТА СДЕЛКА {direction}\n"
+                   f"Монета: {symbol}\n"
+                   f"Цена: {price:.5f}\n"
+                   f"Сумма: {trade_amount:.2f} USDT\n"
+                   f"Плечо: {leverage}x\n"
+                   f"SL: {stop_price:.5f} ({sl_percent*100:.0f}%)\n"
+                   f"TP: {take_price:.5f} ({tp_percent*100:.0f}%)\n"
+                   f"Баланс: {balance:.2f} USDT")
+            await self.send_telegram(msg)
+
+            if symbol in self.signal_state:
+                self.signal_state[symbol]['waiting_for_pullback'] = False
+        except Exception as e:
+            logger.error(f"Ошибка открытия {symbol}: {e}")
+
+    async def close_position(self, symbol, reason, current_price):
+        pos = self.pos_data.get(symbol)
+        if not pos or pos.get('closed'):
+            return
+        try:
+            close_side = 'sell' if pos['direction'] == 'LONG' else 'buy'
+            await self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=close_side,
+                amount=pos['quantity']
+            )
+            logger.info(f"🔴 ЗАКРЫТА {symbol} по {reason}, цена {current_price}")
+            self.pos_data[symbol]['closed'] = True
+
+            balance = await self.get_balance()
+            emoji = "🔴" if reason == 'stop_loss' else "🟢"
+            msg = f"{emoji} СДЕЛКА ЗАКРЫТА\nМонета: {symbol}\nПричина: {reason}\nЦена: {current_price:.5f}\nБаланс: {balance:.2f} USDT"
+            await self.send_telegram(msg)
+
+            if reason == 'stop_loss':
+                self.next_trade_doubled = True
+                await self.send_telegram(f"⚠️ СТОП-ЛОСС\nСледующая сделка будет удвоена")
+            else:
+                self.next_trade_doubled = False
+
+            self.open_positions.discard(symbol)
+            asyncio.create_task(self.delayed_cleanup(symbol))
+        except Exception as e:
+            logger.error(f"Ошибка закрытия {symbol}: {e}")
+
+    async def delayed_cleanup(self, symbol):
+        await asyncio.sleep(10)
+        if symbol in self.pos_data:
+            del self.pos_data[symbol]
+
+    async def monitor_positions(self):
+        while True:
+            for symbol, pos in list(self.pos_data.items()):
+                if pos.get('closed'):
+                    continue
+                try:
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
+                    should_close = False
+                    reason = None
+                    if pos['direction'] == 'LONG':
+                        if current_price <= pos['stop_price']:
+                            should_close = True
+                            reason = 'stop_loss'
+                        elif current_price >= pos['take_price']:
+                            should_close = True
+                            reason = 'take_profit'
+                    else:
+                        if current_price >= pos['stop_price']:
+                            should_close = True
+                            reason = 'stop_loss'
+                        elif current_price <= pos['take_price']:
+                            should_close = True
+                            reason = 'take_profit'
+                    if should_close:
+                        await self.close_position(symbol, reason, current_price)
+                except Exception as e:
+                    logger.error(f"Ошибка мониторинга {symbol}: {e}")
+            await asyncio.sleep(2)
+
+    def calculate_heiken_ashi(self, df):
         df = df.copy()
         df['ha_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         ha_open = [df['open'].iloc[0]]
@@ -50,82 +209,84 @@ class HeikenAshiBot:
         df['ha_color'] = df.apply(lambda row: 'green' if row['ha_close'] >= row['ha_open'] else 'red', axis=1)
         return df
 
-    async def get_market_data(self, symbol, limit=30):
+    async def get_market_data(self, symbol, limit=50):
         try:
-            logger.info(f"Запрашиваю данные для {symbol}...")
             ohlcv = await self.exchange.fetch_ohlcv(symbol, self.config["timeframe"], limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            logger.info(f"Получено {len(df)} свечей для {symbol}")
             return df
         except Exception as e:
-            logger.error(f"Ошибка данных для {symbol}: {e}")
+            logger.error(f"Ошибка данных {symbol}: {e}")
             return None
 
-    async def send_signal(self, symbol, direction, price):
-        bot = Bot(token=self.config["telegram_token"])
-        emoji = "🟢" if direction == 'LONG' else "🔴"
-        direction_ru = "ПОКУПКА" if direction == 'LONG' else "ПРОДАЖА"
-        message = (
-            f"{emoji} **СИГНАЛ НА {direction_ru}**\n\n"
-            f"Монета: {symbol}\n"
-            f"Таймфрейм: {self.config['timeframe']}\n"
-            f"Цена входа: `{price:.5f}`\n\n"
-            f"Время: {datetime.now().strftime('%H:%M:%S')}"
-        )
-        await bot.send_message(chat_id=self.config["telegram_chat_id"], text=message, parse_mode='Markdown')
-        logger.info(f"✅ СИГНАЛ {direction} для {symbol} по {price}")
-
     async def process_symbol(self, symbol):
-        logger.info(f"🔍 Начинаю проверку монеты: {symbol}")
-        df = await self.get_market_data(symbol, limit=30)
-        if df is None or len(df) < 10:
-            logger.warning(f"Недостаточно данных для {symbol}, пропускаю")
+        if symbol in self.open_positions:
+            return
+        logger.info(f"🔍 Проверяю монету: {symbol}")
+        df = await self.get_market_data(symbol, limit=50)
+        if df is None or len(df) < 20:
             return
         df = self.calculate_heiken_ashi(df)
-        current_timestamp = df['timestamp'].iloc[-1]
+        current_ts = df['timestamp'].iloc[-1]
 
-        if symbol not in self.state:
-            self.state[symbol] = {'last_timestamp': None, 'signal_sent': False}
-        state = self.state[symbol]
+        if symbol not in self.signal_state:
+            self.signal_state[symbol] = {
+                'last_candle_ts': None,
+                'waiting_for_pullback': False,
+                'signal_candle_close': None,
+                'signal_direction': None,
+                'signal_volume': 0
+            }
+        state = self.signal_state[symbol]
 
-        if current_timestamp != state['last_timestamp']:
-            state['last_timestamp'] = current_timestamp
-            state['signal_sent'] = False
-            logger.info(f"Новая свеча для {symbol}: {current_timestamp}")
+        if current_ts != state['last_candle_ts']:
+            state['last_candle_ts'] = current_ts
+            prev2 = df['ha_color'].iloc[-3]
+            prev1 = df['ha_color'].iloc[-2]
+            signal_candle = df.iloc[-2]
+            if prev2 == 'red' and prev1 == 'green':
+                state['waiting_for_pullback'] = True
+                state['signal_direction'] = 'LONG'
+                state['signal_candle_close'] = signal_candle['close']
+                state['signal_volume'] = signal_candle['volume']
+                logger.info(f"{symbol}: сигнал LONG, ждём отката вниз")
+            elif prev2 == 'green' and prev1 == 'red':
+                state['waiting_for_pullback'] = True
+                state['signal_direction'] = 'SHORT'
+                state['signal_candle_close'] = signal_candle['close']
+                state['signal_volume'] = signal_candle['volume']
+                logger.info(f"{symbol}: сигнал SHORT, ждём отката вверх")
+            else:
+                state['waiting_for_pullback'] = False
+                state['signal_direction'] = None
 
-        if state['signal_sent']:
-            logger.debug(f"Сигнал для {symbol} уже отправлен, пропускаю")
-            return
-
-        prev2_color = df['ha_color'].iloc[-3]
-        prev1_color = df['ha_color'].iloc[-2]
-        current_candle = df.iloc[-1]
-        current_ha_open = df['ha_open'].iloc[-1]
-
-        if prev2_color == 'red' and prev1_color == 'green':
-            if current_candle['low'] < current_ha_open:
-                await self.send_signal(symbol, 'LONG', current_candle['close'])
-                state['signal_sent'] = True
-        elif prev2_color == 'green' and prev1_color == 'red':
-            if current_candle['high'] > current_ha_open:
-                await self.send_signal(symbol, 'SHORT', current_candle['close'])
-                state['signal_sent'] = True
-        else:
-            logger.debug(f"Условия сигнала не выполнены для {symbol}")
+        if state['waiting_for_pullback']:
+            current_candle = df.iloc[-1]
+            current_ha_open = df['ha_open'].iloc[-1]
+            min_pullback = self.config['trade_params']['min_pullback_percent'] / 100.0
+            if state['signal_direction'] == 'LONG':
+                target_low = min(current_ha_open, state['signal_candle_close']) * (1 - min_pullback)
+                if current_candle['low'] <= target_low:
+                    await self.open_position(symbol, 'LONG', current_candle['close'], current_candle['volume'])
+                    state['waiting_for_pullback'] = False
+            elif state['signal_direction'] == 'SHORT':
+                target_high = max(current_ha_open, state['signal_candle_close']) * (1 + min_pullback)
+                if current_candle['high'] >= target_high:
+                    await self.open_position(symbol, 'SHORT', current_candle['close'], current_candle['volume'])
+                    state['waiting_for_pullback'] = False
 
     async def run(self):
-        await self.load_symbols()
-        logger.info(f"Мониторинг {len(self.all_symbols)} монет на {self.config['timeframe']}")
-
+        await self.load_markets()
+        asyncio.create_task(self.monitor_positions())
+        balance = await self.get_balance()
+        await self.send_telegram(f"🚀 Бот запущен (MEXC)\nТаймфрейм: 30m\nСумма сделки: 4 USDT\nSL: 25%, TP: 25%\nМартингейл: удвоение после стоп-лосса\nБаланс: {balance:.2f} USDT")
         while True:
             for symbol in self.all_symbols:
                 try:
                     await self.process_symbol(symbol)
                 except Exception as e:
-                    logger.error(f"Ошибка при обработке {symbol}: {e}")
-                await asyncio.sleep(1.5)
-            logger.info("Цикл проверки всех монет завершён, ожидание 60 секунд...")
+                    logger.error(f"Ошибка {symbol}: {e}")
+                await asyncio.sleep(0.5)
             await asyncio.sleep(60)
 
     async def close(self):
@@ -133,7 +294,7 @@ class HeikenAshiBot:
 
 async def main():
     config = load_config()
-    bot = HeikenAshiBot(config)
+    bot = TradingBot(config)
     try:
         await bot.run()
     finally:
