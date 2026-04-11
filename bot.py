@@ -2,6 +2,7 @@ import asyncio
 import logging
 import ccxt.async_support as ccxt
 import pandas as pd
+import numpy as np
 import json
 from datetime import datetime
 from telegram import Bot
@@ -27,10 +28,9 @@ class TradingBot:
                 'adjustForTimeDifference': True
             }
         })
-        self.next_trade_doubled = False
         self.open_positions = set()
         self.pos_data = {}
-        self.all_symbols = self.config['symbols']
+        self.all_symbols = []
         self.signal_state = {}
         self.telegram_bot = Bot(token=config["telegram_token"])
 
@@ -50,42 +50,85 @@ class TradingBot:
 
     async def load_markets(self):
         await self.exchange.load_markets()
-        # Фильтруем только те символы, которые есть на бирже
-        valid = [s for s in self.all_symbols if s in self.exchange.markets]
-        self.all_symbols = valid
-        logger.info(f"Загружено {len(self.all_symbols)} доступных пар")
+        all_swap = [symbol for symbol, market in self.exchange.markets.items()
+                    if market['swap'] and market['quote'] == 'USDT']
+        self.all_symbols = all_swap
+        logger.info(f"Загружено {len(self.all_symbols)} фьючерсных пар")
         logger.info(f"Таймфрейм: {self.config['timeframe']}")
 
-    def get_trade_amount(self):
-        base = self.config['trade_params']['fixed_trade_amount']
-        return base * 2 if self.next_trade_doubled else base
+    def calculate_heiken_ashi(self, df):
+        df = df.copy()
+        df['ha_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+        ha_open = [df['open'].iloc[0]]
+        for i in range(1, len(df)):
+            ha_open.append((ha_open[i-1] + df['ha_close'].iloc[i-1]) / 2)
+        df['ha_open'] = ha_open
+        df['ha_high'] = df[['high', 'ha_open', 'ha_close']].max(axis=1)
+        df['ha_low'] = df[['low', 'ha_open', 'ha_close']].min(axis=1)
+        df['ha_color'] = df.apply(lambda row: 'green' if row['ha_close'] >= row['ha_open'] else 'red', axis=1)
+        return df
 
-    async def set_leverage(self, symbol, leverage, side):
+    def add_indicators(self, df):
+        # Bollinger Bands (20,2)
+        df['bb_mid'] = df['close'].rolling(window=20).mean()
+        bb_std = df['close'].rolling(window=20).std()
+        df['bb_upper'] = df['bb_mid'] + bb_std * 2
+        df['bb_lower'] = df['bb_mid'] - bb_std * 2
+        # RSI (14)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        # Средний объём за 10 свечей
+        df['avg_volume'] = df['volume'].rolling(window=10).mean()
+        return df
+
+    async def check_filters(self, symbol, direction, price, volume):
         try:
-            await self.exchange.set_leverage(leverage, symbol, params={'side': side})
-            logger.info(f"Плечо {leverage}x для {symbol} ({side})")
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, self.config['timeframe'], limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = self.add_indicators(df)
+            last = df.iloc[-1]
+            if direction == 'LONG':
+                # Цена ниже средней полосы (не обязательно касание нижней)
+                if last['close'] > last['bb_mid']:
+                    return False
+                if last['rsi'] > 50:
+                    return False
+                if volume < last['avg_volume']:
+                    return False
+            else:  # SHORT
+                if last['close'] < last['bb_mid']:
+                    return False
+                if last['rsi'] < 50:
+                    return False
+                if volume < last['avg_volume']:
+                    return False
+            return True
         except Exception as e:
-            logger.error(f"Ошибка установки плеча {symbol}: {e}")
+            logger.error(f"Ошибка фильтров {symbol}: {e}")
+            return True  # при ошибке пропускаем фильтр
 
     async def open_position(self, symbol, direction, price, volume):
         if len(self.open_positions) >= self.config['max_positions']:
-            logger.warning(f"Лимит позиций ({self.config['max_positions']}) достигнут, пропускаем {symbol}")
+            logger.warning(f"Лимит позиций ({self.config['max_positions']}) достигнут")
             return
 
-        trade_amount = self.get_trade_amount()
+        trade_amount = self.config['trade_params']['fixed_trade_amount']
         leverage = self.config['trade_params']['default_leverage']
         side = 'LONG' if direction == 'LONG' else 'SHORT'
         order_side = 'buy' if direction == 'LONG' else 'sell'
 
-        await self.set_leverage(symbol, leverage, side)
-
         quantity = (trade_amount * leverage) / price
         quantity = round(quantity, 5)
         if quantity <= 0:
-            logger.error(f"Неверное количество {symbol}: {quantity}")
+            logger.error(f"Неверное количество {symbol}")
             return
 
-        logger.info(f"Расчёт: сумма {trade_amount} USDT, плечо {leverage}, цена {price} → количество {quantity}")
+        if not await self.check_filters(symbol, direction, price, volume):
+            logger.info(f"{symbol}: фильтры не пройдены, вход отменён")
+            return
 
         try:
             sl_percent = self.config['trade_params']['sl_percent']
@@ -104,10 +147,7 @@ class TradingBot:
                 amount=quantity,
                 params={'positionSide': side}
             )
-            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
-            logger.info(f"SL: {stop_price:.5f} (изм {abs(stop_price/price - 1)*100:.2f}%)")
-            logger.info(f"TP: {take_price:.5f} (изм {abs(take_price/price - 1)*100:.2f}%)")
-
+            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT")
             self.open_positions.add(symbol)
             self.pos_data[symbol] = {
                 'direction': direction,
@@ -121,19 +161,12 @@ class TradingBot:
                 'trailing_activated': False,
                 'breakeven_stop': None
             }
-
             balance = await self.get_balance()
             emoji = "🟢" if direction == 'LONG' else "🔴"
             msg = (f"{emoji} ОТКРЫТА СДЕЛКА {direction}\n"
                    f"Монета: {symbol}\nЦена: {price:.5f}\nСумма: {trade_amount:.2f} USDT\n"
-                   f"Плечо: {leverage}x\nКол-во: {quantity:.5f}\n"
-                   f"SL: {stop_price:.5f} ({sl_percent*100:.0f}%)\n"
-                   f"TP: {take_price:.5f} ({tp_percent*100:.0f}%)\n"
-                   f"Баланс: {balance:.2f} USDT")
+                   f"SL: {stop_price:.5f}\nTP: {take_price:.5f}\nБаланс: {balance:.2f} USDT")
             await self.send_telegram(msg)
-
-            if symbol in self.signal_state:
-                self.signal_state[symbol]['waiting_for_pullback'] = False
         except Exception as e:
             logger.error(f"Ошибка открытия {symbol}: {e}")
 
@@ -149,22 +182,14 @@ class TradingBot:
                 type='market',
                 side=close_side,
                 amount=pos['quantity'],
-                params={'reduceOnly': True, 'positionSide': side}
+                params={'positionSide': side}
             )
             logger.info(f"🔴 ЗАКРЫТА {symbol} по {reason}, цена {current_price}")
             self.pos_data[symbol]['closed'] = True
-
             balance = await self.get_balance()
             emoji = "🔴" if reason == 'stop_loss' else "🟢"
             msg = f"{emoji} СДЕЛКА ЗАКРЫТА\nМонета: {symbol}\nПричина: {reason}\nЦена: {current_price:.5f}\nБаланс: {balance:.2f} USDT"
             await self.send_telegram(msg)
-
-            if reason == 'stop_loss':
-                self.next_trade_doubled = True
-                await self.send_telegram(f"⚠️ СТОП-ЛОСС\nСледующая сделка будет удвоена")
-            else:
-                self.next_trade_doubled = False
-
             self.open_positions.discard(symbol)
             asyncio.create_task(self.delayed_cleanup(symbol))
         except Exception as e:
@@ -185,8 +210,6 @@ class TradingBot:
                     cur_price = ticker['last']
                     should_close = False
                     reason = None
-
-                    # Трейлинг-стоп: после 50% от TP перемещаем стоп в безубыток
                     tp_percent = self.config['trade_params']['tp_percent']
                     activation = self.config['trade_params'].get('trailing_stop_activation', 0.5)
                     if not pos.get('trailing_activated'):
@@ -194,9 +217,8 @@ class TradingBot:
                         if profit_percent >= tp_percent * activation:
                             pos['trailing_activated'] = True
                             pos['breakeven_stop'] = pos['entry_price']
-                            logger.info(f"{symbol}: трейлинг-стоп активирован на {pos['entry_price']}")
+                            logger.info(f"{symbol}: трейлинг-стоп активирован")
                             await self.send_telegram(f"🔒 {symbol}: трейлинг-стоп, стоп на {pos['entry_price']:.5f}")
-
                     if pos.get('trailing_activated') and pos['breakeven_stop']:
                         if pos['direction'] == 'LONG' and cur_price <= pos['breakeven_stop']:
                             should_close = True
@@ -204,7 +226,6 @@ class TradingBot:
                         elif pos['direction'] == 'SHORT' and cur_price >= pos['breakeven_stop']:
                             should_close = True
                             reason = 'trailing_stop'
-
                     if not should_close:
                         if pos['direction'] == 'LONG':
                             if cur_price <= pos['stop_price']:
@@ -220,7 +241,6 @@ class TradingBot:
                             elif cur_price <= pos['take_price']:
                                 should_close = True
                                 reason = 'take_profit'
-
                     if should_close:
                         await self.close_position(symbol, reason, cur_price)
                 except Exception as e:
@@ -252,7 +272,6 @@ class TradingBot:
     async def process_symbol(self, symbol):
         if symbol in self.open_positions:
             return
-        logger.info(f"🔍 Проверяю монету: {symbol}")
         df = await self.get_market_data(symbol, limit=50)
         if df is None or len(df) < 20:
             return
@@ -278,15 +297,16 @@ class TradingBot:
                 state['waiting_for_pullback'] = True
                 state['signal_direction'] = 'LONG'
                 state['signal_candle_close'] = sig_candle['close']
+                state['signal_volume'] = sig_candle['volume']
                 logger.info(f"{symbol}: сигнал LONG, ждём отката вниз")
             elif prev2 == 'green' and prev1 == 'red':
                 state['waiting_for_pullback'] = True
                 state['signal_direction'] = 'SHORT'
                 state['signal_candle_close'] = sig_candle['close']
+                state['signal_volume'] = sig_candle['volume']
                 logger.info(f"{symbol}: сигнал SHORT, ждём отката вверх")
             else:
                 state['waiting_for_pullback'] = False
-                state['signal_direction'] = None
 
         if state['waiting_for_pullback']:
             curr_candle = df.iloc[-1]
@@ -308,11 +328,13 @@ class TradingBot:
         asyncio.create_task(self.monitor_positions())
         balance = await self.get_balance()
         await self.send_telegram(
-            f"🚀 Бот запущен (BingX)\n"
-            f"Таймфрейм: 30m\nСумма сделки: 1 USDT\nSL/TP: 50%\n"
-            f"Мартингейл: удвоение после стоп-лосса\nТрейлинг-стоп: при 50% TP\n"
-            f"Максимум позиций: {self.config['max_positions']}\n"
-            f"Плечо: 50x\nБаланс: {balance:.2f} USDT"
+            f"🚀 БОТ ЗАПУЩЕН (АГРЕССИВНЫЙ РЕЖИМ)\n"
+            f"Таймфрейм: {self.config['timeframe']}\n"
+            f"Сумма сделки: {self.config['trade_params']['fixed_trade_amount']} USDT\n"
+            f"SL/TP: 50%\n"
+            f"Макс. позиций: {self.config['max_positions']}\n"
+            f"Баланс: {balance:.2f} USDT\n"
+            f"Цель: $4/час"
         )
         while True:
             for symbol in self.all_symbols:
@@ -321,7 +343,7 @@ class TradingBot:
                 except Exception as e:
                     logger.error(f"Ошибка {symbol}: {e}")
                 await asyncio.sleep(0.5)
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)  # 30 секунд между циклами для 5-минутного ТФ
 
     async def close(self):
         await self.exchange.close()
