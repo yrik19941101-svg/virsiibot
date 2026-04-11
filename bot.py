@@ -83,12 +83,27 @@ class TradingBot:
                 stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
                 take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
 
-            await self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side=side,
-                amount=quantity
-            )
+            # Повторные попытки при ошибке Oversold
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await self.exchange.create_order(
+                        symbol=symbol,
+                        type='market',
+                        side=side,
+                        amount=quantity
+                    )
+                    break
+                except Exception as e:
+                    if '30005' in str(e) or 'Oversold' in str(e):
+                        wait = 2 ** attempt
+                        logger.warning(f"Oversold для {symbol}, повтор через {wait} сек (попытка {attempt+1}/{max_retries})")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+            else:
+                raise Exception(f"Не удалось открыть {symbol} после {max_retries} попыток")
+
             logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
             logger.info(f"SL: {stop_price:.5f} (изм {abs(stop_price/price - 1)*100:.2f}%)")
             logger.info(f"TP: {take_price:.5f} (изм {abs(take_price/price - 1)*100:.2f}%)")
@@ -289,15 +304,15 @@ class TradingBot:
         await self.load_markets()
         asyncio.create_task(self.monitor_positions())
         balance = await self.get_balance()
-        await self.send_telegram(f"🚀 Бот запущен (MEXC, простой расчёт)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nSL/TP: 50%\nТрейлинг-стоп: при 50% TP\nПлечо: 50x (настроено вручную)\nБаланс: {balance:.2f} USDT")
+        await self.send_telegram(f"🚀 Бот запущен (MEXC, увеличены задержки)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nSL/TP: 50%\nТрейлинг-стоп: при 50% TP\nПлечо: 50x (настроено вручную)\nБаланс: {balance:.2f} USDT")
         while True:
             for symbol in self.all_symbols:
                 try:
                     await self.process_symbol(symbol)
                 except Exception as e:
                     logger.error(f"Ошибка {symbol}: {e}")
-                await asyncio.sleep(0.5)
-            await asyncio.sleep(60)
+                await asyncio.sleep(1.5)   # увеличенная задержка между монетами
+            await asyncio.sleep(120)       # увеличенная задержка между циклами
 
     async def close(self):
         await self.exchange.close()
