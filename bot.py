@@ -51,18 +51,15 @@ class TradingBot:
     async def load_markets(self):
         await self.exchange.load_markets()
         logger.info(f"Загружено рынков, используем {len(self.all_symbols)} указанных пар")
-        logger.info(f"Таймфрейм: {self.config['timeframe']}, плечо: {self.config['trade_params']['default_leverage']}x")
+        logger.info(f"Таймфрейм: {self.config['timeframe']}")
 
     def get_trade_amount(self):
         base = self.config['trade_params']['fixed_trade_amount']
         return base * 2 if self.next_trade_doubled else base
 
-    async def set_leverage(self, symbol, leverage):
-        try:
-            await self.exchange.set_leverage(leverage, symbol)
-            logger.info(f"Плечо {leverage}x для {symbol}")
-        except Exception as e:
-            logger.error(f"Ошибка установки плеча {symbol}: {e}")
+    # Убираем set_leverage – плечо уже настроено вручную
+    # async def set_leverage(self, symbol, leverage):
+    #     pass
 
     async def open_position(self, symbol, direction, price, volume):
         if len(self.open_positions) >= self.config['max_positions']:
@@ -70,11 +67,10 @@ class TradingBot:
             return
 
         trade_amount = self.get_trade_amount()
-        leverage = self.config['trade_params']['default_leverage']
+        leverage = self.config['trade_params']['default_leverage']  # используется только для расчёта SL/TP
         side = 'buy' if direction == 'LONG' else 'sell'
-        # Количество контрактов = (сумма в USDT * плечо) / цена
+        # Расчёт количества контрактов: (сумма в USDT * плечо) / цена
         quantity = (trade_amount * leverage) / price
-        # Округляем до 5 знаков (CCXT сам подстроит под шаг биржи)
         quantity = round(quantity, 5)
         if quantity <= 0:
             logger.error(f"Неверное количество {symbol}: {quantity}, цена={price}, сумма={trade_amount}, плечо={leverage}")
@@ -83,7 +79,7 @@ class TradingBot:
         logger.info(f"Расчёт: сумма {trade_amount} USDT, плечо {leverage}, цена {price} → количество {quantity}")
 
         try:
-            await self.set_leverage(symbol, leverage)
+            # Не вызываем set_leverage, полагаемся на ручную настройку плеча на бирже
 
             sl_percent = self.config['trade_params']['sl_percent']
             tp_percent = self.config['trade_params']['tp_percent']
@@ -94,7 +90,7 @@ class TradingBot:
                 stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
                 take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
 
-            # Открываем рыночный ордер (без TP/SL, полагаемся на мониторинг)
+            # Открываем рыночный ордер
             order = await self.exchange.create_order(
                 symbol=symbol,
                 type='market',
@@ -184,7 +180,6 @@ class TradingBot:
                     should_close = False
                     reason = None
 
-                    # Трейлинг-стоп (безубыток после 50% TP)
                     tp_percent = self.config['trade_params']['tp_percent']
                     activation = self.config['trade_params'].get('trailing_stop_activation', 0.5)
                     if not pos.get('trailing_activated'):
@@ -307,14 +302,14 @@ class TradingBot:
         await self.load_markets()
         asyncio.create_task(self.monitor_positions())
         balance = await self.get_balance()
-        await self.send_telegram(f"🚀 Бот запущен (MEXC)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nПлечо: 50x\nSL: 50%, TP: 50%\nМартингейл: удвоение после стоп-лосса\nТрейлинг-стоп: после 50% TP\nБаланс: {balance:.2f} USDT")
+        await self.send_telegram(f"🚀 Бот запущен (MEXC, только указанные пары)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nSL: 50%, TP: 50%\nМартингейл: удвоение после стоп-лосса\nТрейлинг-стоп: после 50% TP\nПлечо используется только для расчёта, на бирже должно быть установлено вручную\nБаланс: {balance:.2f} USDT")
         while True:
             for symbol in self.all_symbols:
                 try:
                     await self.process_symbol(symbol)
                 except Exception as e:
                     logger.error(f"Ошибка {symbol}: {e}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)  # задержка между монетами
             await asyncio.sleep(60)
 
     async def close(self):
