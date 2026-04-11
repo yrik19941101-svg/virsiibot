@@ -50,12 +50,22 @@ class TradingBot:
 
     async def load_markets(self):
         await self.exchange.load_markets()
-        logger.info(f"Загружено рынков, используем {len(self.all_symbols)} пар")
+        # Фильтруем только те символы, которые есть на бирже
+        valid = [s for s in self.all_symbols if s in self.exchange.markets]
+        self.all_symbols = valid
+        logger.info(f"Загружено {len(self.all_symbols)} доступных пар")
         logger.info(f"Таймфрейм: {self.config['timeframe']}")
 
     def get_trade_amount(self):
         base = self.config['trade_params']['fixed_trade_amount']
         return base * 2 if self.next_trade_doubled else base
+
+    async def set_leverage(self, symbol, leverage, side):
+        try:
+            await self.exchange.set_leverage(leverage, symbol, params={'side': side})
+            logger.info(f"Плечо {leverage}x для {symbol} ({side})")
+        except Exception as e:
+            logger.error(f"Ошибка установки плеча {symbol}: {e}")
 
     async def open_position(self, symbol, direction, price, volume):
         if len(self.open_positions) >= self.config['max_positions']:
@@ -64,7 +74,11 @@ class TradingBot:
 
         trade_amount = self.get_trade_amount()
         leverage = self.config['trade_params']['default_leverage']
-        side = 'buy' if direction == 'LONG' else 'sell'
+        side = 'LONG' if direction == 'LONG' else 'SHORT'
+        order_side = 'buy' if direction == 'LONG' else 'sell'
+
+        await self.set_leverage(symbol, leverage, side)
+
         quantity = (trade_amount * leverage) / price
         quantity = round(quantity, 5)
         if quantity <= 0:
@@ -83,27 +97,13 @@ class TradingBot:
                 stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
                 take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
 
-            # Повторные попытки при ошибке Oversold
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    await self.exchange.create_order(
-                        symbol=symbol,
-                        type='market',
-                        side=side,
-                        amount=quantity
-                    )
-                    break
-                except Exception as e:
-                    if '30005' in str(e) or 'Oversold' in str(e):
-                        wait = 2 ** attempt
-                        logger.warning(f"Oversold для {symbol}, повтор через {wait} сек (попытка {attempt+1}/{max_retries})")
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
-            else:
-                raise Exception(f"Не удалось открыть {symbol} после {max_retries} попыток")
-
+            await self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=order_side,
+                amount=quantity,
+                params={'positionSide': side}
+            )
             logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
             logger.info(f"SL: {stop_price:.5f} (изм {abs(stop_price/price - 1)*100:.2f}%)")
             logger.info(f"TP: {take_price:.5f} (изм {abs(take_price/price - 1)*100:.2f}%)")
@@ -143,11 +143,13 @@ class TradingBot:
             return
         try:
             close_side = 'sell' if pos['direction'] == 'LONG' else 'buy'
+            side = 'LONG' if pos['direction'] == 'LONG' else 'SHORT'
             await self.exchange.create_order(
                 symbol=symbol,
                 type='market',
                 side=close_side,
-                amount=pos['quantity']
+                amount=pos['quantity'],
+                params={'reduceOnly': True, 'positionSide': side}
             )
             logger.info(f"🔴 ЗАКРЫТА {symbol} по {reason}, цена {current_price}")
             self.pos_data[symbol]['closed'] = True
@@ -184,6 +186,7 @@ class TradingBot:
                     should_close = False
                     reason = None
 
+                    # Трейлинг-стоп: после 50% от TP перемещаем стоп в безубыток
                     tp_percent = self.config['trade_params']['tp_percent']
                     activation = self.config['trade_params'].get('trailing_stop_activation', 0.5)
                     if not pos.get('trailing_activated'):
@@ -304,15 +307,21 @@ class TradingBot:
         await self.load_markets()
         asyncio.create_task(self.monitor_positions())
         balance = await self.get_balance()
-        await self.send_telegram(f"🚀 Бот запущен (MEXC, увеличены задержки)\nТаймфрейм: 30m\nСумма сделки: 2 USDT\nSL/TP: 50%\nТрейлинг-стоп: при 50% TP\nПлечо: 50x (настроено вручную)\nБаланс: {balance:.2f} USDT")
+        await self.send_telegram(
+            f"🚀 Бот запущен (BingX)\n"
+            f"Таймфрейм: 30m\nСумма сделки: 1 USDT\nSL/TP: 50%\n"
+            f"Мартингейл: удвоение после стоп-лосса\nТрейлинг-стоп: при 50% TP\n"
+            f"Максимум позиций: {self.config['max_positions']}\n"
+            f"Плечо: 50x\nБаланс: {balance:.2f} USDT"
+        )
         while True:
             for symbol in self.all_symbols:
                 try:
                     await self.process_symbol(symbol)
                 except Exception as e:
                     logger.error(f"Ошибка {symbol}: {e}")
-                await asyncio.sleep(1.5)   # увеличенная задержка между монетами
-            await asyncio.sleep(120)       # увеличенная задержка между циклами
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(60)
 
     async def close(self):
         await self.exchange.close()
