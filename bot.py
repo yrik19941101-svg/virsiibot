@@ -3,6 +3,7 @@ import logging
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
+import math
 import json
 from datetime import datetime
 from telegram import Bot
@@ -73,20 +74,30 @@ class TradingBot:
         trade_amount = self.get_trade_amount()
         leverage = self.config['trade_params']['default_leverage']
         side = 'buy' if direction == 'LONG' else 'sell'
-        raw_qty = (trade_amount * leverage) / price
+        raw_quantity = (trade_amount * leverage) / price
+
+        # Получаем спецификацию рынка для MEXC
         market = self.exchange.market(symbol)
+        contract_size = market.get('contractSize', 1)  # обычно 1 контракт = 1 монета
         min_qty = market['limits']['amount']['min']
-        precision = market['precision']['amount']
-        # округляем до шага, но не меньше min_qty
-        qty = max(min_qty, raw_qty)
-        if precision:
-            qty = round(qty, int(round(-np.log10(precision))))
+        # Количество контрактов – округляем вверх до целого
+        contracts = math.ceil(raw_quantity / contract_size)
+        quantity = contracts * contract_size
+        # Если количество получилось меньше минимального, берём минимальное
+        if min_qty and quantity < min_qty:
+            quantity = min_qty
+        # Дополнительно округляем до шага (precision)
+        precision = market.get('precision', {}).get('amount')
+        if precision and precision > 0:
+            quantity = round(quantity, int(round(-math.log10(precision))))
         else:
-            qty = round(qty, 5)
-        if qty <= 0:
-            logger.error(f"Неверное количество {symbol}: {qty}")
+            quantity = round(quantity, 5)
+
+        if quantity <= 0:
+            logger.error(f"Неверное количество {symbol}: {quantity}")
             return
-        logger.info(f"Расчёт: сумма {trade_amount} USDT, плечо {leverage}, цена {price} -> кол-во {qty} (min {min_qty})")
+
+        logger.info(f"Расчёт: сумма {trade_amount} USDT, плечо {leverage}, цена {price} -> сырое {raw_quantity:.5f} -> контрактов {contracts} -> кол-во {quantity} (min {min_qty})")
 
         try:
             sl_percent = self.config['trade_params']['sl_percent']
@@ -98,13 +109,29 @@ class TradingBot:
                 stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
                 take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
 
-            order = await self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side=side,
-                amount=qty
-            )
-            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {qty} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
+            # Повторные попытки при ошибке Oversold (30005)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    order = await self.exchange.create_order(
+                        symbol=symbol,
+                        type='market',
+                        side=side,
+                        amount=quantity
+                    )
+                    break
+                except Exception as e:
+                    error_msg = str(e)
+                    if '30005' in error_msg or 'Oversold' in error_msg:
+                        wait = 2 ** attempt
+                        logger.warning(f"Oversold для {symbol}, повтор через {wait} сек (попытка {attempt+1}/{max_retries})")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise e
+            else:
+                raise Exception(f"Не удалось открыть {symbol} после {max_retries} попыток")
+
+            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT, плечо {leverage}")
             logger.info(f"SL: {stop_price:.5f} (изм {abs(stop_price/price - 1)*100:.2f}%)")
             logger.info(f"TP: {take_price:.5f} (изм {abs(take_price/price - 1)*100:.2f}%)")
 
@@ -112,7 +139,7 @@ class TradingBot:
             self.pos_data[symbol] = {
                 'direction': direction,
                 'entry_price': price,
-                'quantity': qty,
+                'quantity': quantity,
                 'stop_price': stop_price,
                 'take_price': take_price,
                 'trade_amount': trade_amount,
@@ -126,7 +153,7 @@ class TradingBot:
             emoji = "🟢" if direction == 'LONG' else "🔴"
             msg = (f"{emoji} ОТКРЫТА СДЕЛКА {direction}\n"
                    f"Монета: {symbol}\nЦена: {price:.5f}\nСумма: {trade_amount:.2f} USDT\n"
-                   f"Плечо: {leverage}x\nКол-во: {qty:.5f}\n"
+                   f"Плечо: {leverage}x\nКол-во: {quantity:.5f}\n"
                    f"SL: {stop_price:.5f} ({sl_percent*100:.0f}%)\n"
                    f"TP: {take_price:.5f} ({tp_percent*100:.0f}%)\n"
                    f"Баланс: {balance:.2f} USDT")
@@ -310,7 +337,9 @@ class TradingBot:
             f"🚀 Бот запущен (MEXC)\n"
             f"Таймфрейм: 30m\nСумма: 2 USDT\nSL/TP: 50%\n"
             f"Мартингейл: удвоение после стоп-лосса\nТрейлинг-стоп: при 50% TP\n"
-            f"Плечо: 50x (должно быть настроено вручную)\nБаланс: {balance:.2f} USDT"
+            f"Плечо: 50x (должно быть настроено вручную)\n"
+            f"Исправление: целые контракты, увеличенные задержки, повтор при Oversold\n"
+            f"Баланс: {balance:.2f} USDT"
         )
         while True:
             for symbol in self.all_symbols:
@@ -318,8 +347,8 @@ class TradingBot:
                     await self.process_symbol(symbol)
                 except Exception as e:
                     logger.error(f"Ошибка {symbol}: {e}")
-                await asyncio.sleep(0.5)
-            await asyncio.sleep(60)
+                await asyncio.sleep(1)   # увеличенная задержка между монетами
+            await asyncio.sleep(120)     # увеличенная задержка между циклами
 
     async def close(self):
         await self.exchange.close()
