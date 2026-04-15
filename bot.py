@@ -2,12 +2,12 @@ import asyncio
 import logging
 import ccxt.async_support as ccxt
 import pandas as pd
-import numpy as np
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Bot
+from typing import Optional, Dict, Any
 
-CONFIG_FILE = "config.json"
+CONFIG_FILE = "config_signals_precise.json"
 
 def load_config():
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -16,345 +16,288 @@ def load_config():
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class TradingBot:
+
+class SignalBot:
     def __init__(self, config):
         self.config = config
+
         self.exchange = getattr(ccxt, config["exchange"])({
             'enableRateLimit': True,
-            'apiKey': config['api_key'],
-            'secret': config['api_secret'],
+            'apiKey': config.get('api_key', ''),
+            'secret': config.get('api_secret', ''),
             'options': {
                 'defaultType': 'swap',
                 'adjustForTimeDifference': True
             }
         })
-        self.open_positions = set()
-        self.pos_data = {}
-        self.all_symbols = []
-        self.signal_state = {}
+
         self.telegram_bot = Bot(token=config["telegram_token"])
 
-    async def get_balance(self):
+        self.all_symbols = []
+        self.blacklist = set()
+        self.sent_signals: Dict[str, Dict[str, Any]] = {}
+
+        self.telegram_retry_count = config.get("telegram_retry_count", 3)
+        self.telegram_retry_delay = config.get("telegram_retry_delay", 5)
+
+        blacklist_from_config = self.config.get('blacklist_symbols', [])
+        for sym in blacklist_from_config:
+            self.blacklist.add(sym)
+        logger.info(f"Загружено {len(blacklist_from_config)} символов в чёрный список")
+
+    async def send_telegram_signal(self, symbol, signal_type, timeframe, price, reason=""):
+        msg = (f"🎯 ТОЧНЫЙ СИГНАЛ {signal_type} ({timeframe})\n"
+               f"Монета: {symbol}\n"
+               f"Цена входа: {price:.5f}\n"
+               f"Причина: {reason}\n"
+               f"Время: {datetime.now().strftime('%H:%M:%S')}")
+
+        for i in range(self.telegram_retry_count):
+            try:
+                await self.telegram_bot.send_message(
+                    chat_id=self.config["telegram_chat_id"],
+                    text=msg,
+                    parse_mode=None
+                )
+                return
+            except Exception as e:
+                if i < self.telegram_retry_count - 1:
+                    logger.warning(f"Повторная попытка Telegram {i+1}/{self.telegram_retry_count}: {e}")
+                    await asyncio.sleep(self.telegram_retry_delay)
+                else:
+                    logger.error(f"Ошибка Telegram после {self.telegram_retry_count} попыток: {e}")
+
+    async def get_market_data(self, symbol, timeframe, limit=20):
         try:
-            balance = await self.exchange.fetch_balance()
-            return balance['USDT']['free']
-        except Exception as e:
-            logger.error(f"Ошибка баланса: {e}")
-            return 0.0
-
-    async def send_telegram(self, message):
-        try:
-            await self.telegram_bot.send_message(chat_id=self.config["telegram_chat_id"], text=message, parse_mode=None)
-        except Exception as e:
-            logger.error(f"Ошибка Telegram: {e}")
-
-    async def load_markets(self):
-        await self.exchange.load_markets()
-        all_swap = [symbol for symbol, market in self.exchange.markets.items()
-                    if market['swap'] and market['quote'] == 'USDT']
-        self.all_symbols = all_swap
-        logger.info(f"Загружено {len(self.all_symbols)} фьючерсных пар")
-        logger.info(f"Таймфрейм: {self.config['timeframe']}")
-
-    def calculate_heiken_ashi(self, df):
-        df = df.copy()
-        df['ha_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-        ha_open = [df['open'].iloc[0]]
-        for i in range(1, len(df)):
-            ha_open.append((ha_open[i-1] + df['ha_close'].iloc[i-1]) / 2)
-        df['ha_open'] = ha_open
-        df['ha_high'] = df[['high', 'ha_open', 'ha_close']].max(axis=1)
-        df['ha_low'] = df[['low', 'ha_open', 'ha_close']].min(axis=1)
-        df['ha_color'] = df.apply(lambda row: 'green' if row['ha_close'] >= row['ha_open'] else 'red', axis=1)
-        return df
-
-    def add_indicators(self, df):
-        # Bollinger Bands (20,2)
-        df['bb_mid'] = df['close'].rolling(window=20).mean()
-        bb_std = df['close'].rolling(window=20).std()
-        df['bb_upper'] = df['bb_mid'] + bb_std * 2
-        df['bb_lower'] = df['bb_mid'] - bb_std * 2
-        # RSI (14)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-        # Средний объём за 10 свечей
-        df['avg_volume'] = df['volume'].rolling(window=10).mean()
-        return df
-
-    async def check_filters(self, symbol, direction, price, volume):
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, self.config['timeframe'], limit=50)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df = self.add_indicators(df)
-            last = df.iloc[-1]
-            if direction == 'LONG':
-                # Цена ниже средней полосы (не обязательно касание нижней)
-                if last['close'] > last['bb_mid']:
-                    return False
-                if last['rsi'] > 50:
-                    return False
-                if volume < last['avg_volume']:
-                    return False
-            else:  # SHORT
-                if last['close'] < last['bb_mid']:
-                    return False
-                if last['rsi'] < 50:
-                    return False
-                if volume < last['avg_volume']:
-                    return False
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка фильтров {symbol}: {e}")
-            return True  # при ошибке пропускаем фильтр
-
-    async def open_position(self, symbol, direction, price, volume):
-        if len(self.open_positions) >= self.config['max_positions']:
-            logger.warning(f"Лимит позиций ({self.config['max_positions']}) достигнут")
-            return
-
-        trade_amount = self.config['trade_params']['fixed_trade_amount']
-        leverage = self.config['trade_params']['default_leverage']
-        side = 'LONG' if direction == 'LONG' else 'SHORT'
-        order_side = 'buy' if direction == 'LONG' else 'sell'
-
-        quantity = (trade_amount * leverage) / price
-        quantity = round(quantity, 5)
-        if quantity <= 0:
-            logger.error(f"Неверное количество {symbol}")
-            return
-
-        if not await self.check_filters(symbol, direction, price, volume):
-            logger.info(f"{symbol}: фильтры не пройдены, вход отменён")
-            return
-
-        try:
-            sl_percent = self.config['trade_params']['sl_percent']
-            tp_percent = self.config['trade_params']['tp_percent']
-            if direction == 'LONG':
-                stop_price = round(price * (1 - (1/leverage) * sl_percent), 5)
-                take_price = round(price * (1 + (1/leverage) * tp_percent), 5)
-            else:
-                stop_price = round(price * (1 + (1/leverage) * sl_percent), 5)
-                take_price = round(price * (1 - (1/leverage) * tp_percent), 5)
-
-            await self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side=order_side,
-                amount=quantity,
-                params={'positionSide': side}
-            )
-            logger.info(f"🟢 ОТКРЫТА {direction} {symbol}: {quantity} по {price}, сумма {trade_amount} USDT")
-            self.open_positions.add(symbol)
-            self.pos_data[symbol] = {
-                'direction': direction,
-                'entry_price': price,
-                'quantity': quantity,
-                'stop_price': stop_price,
-                'take_price': take_price,
-                'trade_amount': trade_amount,
-                'leverage': leverage,
-                'closed': False,
-                'trailing_activated': False,
-                'breakeven_stop': None
-            }
-            balance = await self.get_balance()
-            emoji = "🟢" if direction == 'LONG' else "🔴"
-            msg = (f"{emoji} ОТКРЫТА СДЕЛКА {direction}\n"
-                   f"Монета: {symbol}\nЦена: {price:.5f}\nСумма: {trade_amount:.2f} USDT\n"
-                   f"SL: {stop_price:.5f}\nTP: {take_price:.5f}\nБаланс: {balance:.2f} USDT")
-            await self.send_telegram(msg)
-        except Exception as e:
-            logger.error(f"Ошибка открытия {symbol}: {e}")
-
-    async def close_position(self, symbol, reason, current_price):
-        pos = self.pos_data.get(symbol)
-        if not pos or pos.get('closed'):
-            return
-        try:
-            close_side = 'sell' if pos['direction'] == 'LONG' else 'buy'
-            side = 'LONG' if pos['direction'] == 'LONG' else 'SHORT'
-            await self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side=close_side,
-                amount=pos['quantity'],
-                params={'positionSide': side}
-            )
-            logger.info(f"🔴 ЗАКРЫТА {symbol} по {reason}, цена {current_price}")
-            self.pos_data[symbol]['closed'] = True
-            balance = await self.get_balance()
-            emoji = "🔴" if reason == 'stop_loss' else "🟢"
-            msg = f"{emoji} СДЕЛКА ЗАКРЫТА\nМонета: {symbol}\nПричина: {reason}\nЦена: {current_price:.5f}\nБаланс: {balance:.2f} USDT"
-            await self.send_telegram(msg)
-            self.open_positions.discard(symbol)
-            asyncio.create_task(self.delayed_cleanup(symbol))
-        except Exception as e:
-            logger.error(f"Ошибка закрытия {symbol}: {e}")
-
-    async def delayed_cleanup(self, symbol):
-        await asyncio.sleep(10)
-        if symbol in self.pos_data:
-            del self.pos_data[symbol]
-
-    async def monitor_positions(self):
-        while True:
-            for symbol, pos in list(self.pos_data.items()):
-                if pos.get('closed'):
-                    continue
-                try:
-                    ticker = await self.exchange.fetch_ticker(symbol)
-                    cur_price = ticker['last']
-                    should_close = False
-                    reason = None
-                    tp_percent = self.config['trade_params']['tp_percent']
-                    activation = self.config['trade_params'].get('trailing_stop_activation', 0.5)
-                    if not pos.get('trailing_activated'):
-                        profit_percent = (cur_price - pos['entry_price']) / pos['entry_price'] if pos['direction'] == 'LONG' else (pos['entry_price'] - cur_price) / pos['entry_price']
-                        if profit_percent >= tp_percent * activation:
-                            pos['trailing_activated'] = True
-                            pos['breakeven_stop'] = pos['entry_price']
-                            logger.info(f"{symbol}: трейлинг-стоп активирован")
-                            await self.send_telegram(f"🔒 {symbol}: трейлинг-стоп, стоп на {pos['entry_price']:.5f}")
-                    if pos.get('trailing_activated') and pos['breakeven_stop']:
-                        if pos['direction'] == 'LONG' and cur_price <= pos['breakeven_stop']:
-                            should_close = True
-                            reason = 'trailing_stop'
-                        elif pos['direction'] == 'SHORT' and cur_price >= pos['breakeven_stop']:
-                            should_close = True
-                            reason = 'trailing_stop'
-                    if not should_close:
-                        if pos['direction'] == 'LONG':
-                            if cur_price <= pos['stop_price']:
-                                should_close = True
-                                reason = 'stop_loss'
-                            elif cur_price >= pos['take_price']:
-                                should_close = True
-                                reason = 'take_profit'
-                        else:
-                            if cur_price >= pos['stop_price']:
-                                should_close = True
-                                reason = 'stop_loss'
-                            elif cur_price <= pos['take_price']:
-                                should_close = True
-                                reason = 'take_profit'
-                    if should_close:
-                        await self.close_position(symbol, reason, cur_price)
-                except Exception as e:
-                    logger.error(f"Ошибка мониторинга {symbol}: {e}")
-            await asyncio.sleep(2)
-
-    def calculate_heiken_ashi(self, df):
-        df = df.copy()
-        df['ha_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-        ha_open = [df['open'].iloc[0]]
-        for i in range(1, len(df)):
-            ha_open.append((ha_open[i-1] + df['ha_close'].iloc[i-1]) / 2)
-        df['ha_open'] = ha_open
-        df['ha_high'] = df[['high', 'ha_open', 'ha_close']].max(axis=1)
-        df['ha_low'] = df[['low', 'ha_open', 'ha_close']].min(axis=1)
-        df['ha_color'] = df.apply(lambda row: 'green' if row['ha_close'] >= row['ha_open'] else 'red', axis=1)
-        return df
-
-    async def get_market_data(self, symbol, limit=50):
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, self.config["timeframe"], limit=limit)
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
         except Exception as e:
-            logger.error(f"Ошибка данных {symbol}: {e}")
+            if 'pause currently' not in str(e) and 'not found' not in str(e):
+                logger.error(f"Ошибка данных {symbol} ({timeframe}): {e}")
             return None
 
-    async def process_symbol(self, symbol):
-        if symbol in self.open_positions:
-            return
-        df = await self.get_market_data(symbol, limit=50)
-        if df is None or len(df) < 20:
-            return
-        df = self.calculate_heiken_ashi(df)
-        current_ts = df['timestamp'].iloc[-1]
+    def calculate_heiken_ashi(self, df):
+        df = df.copy()
+        df['ha_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+        ha_open = [df['open'].iloc[0]]
+        for i in range(1, len(df)):
+            ha_open.append((ha_open[i-1] + df['ha_close'].iloc[i-1]) / 2)
+        df['ha_open'] = ha_open
+        df['ha_high'] = df[['high', 'ha_open', 'ha_close']].max(axis=1)
+        df['ha_low'] = df[['low', 'ha_open', 'ha_close']].min(axis=1)
+        df['ha_color'] = df.apply(
+            lambda row: 'green' if row['ha_close'] >= row['ha_open'] else 'red',
+            axis=1
+        )
+        return df
 
-        if symbol not in self.signal_state:
-            self.signal_state[symbol] = {
-                'last_candle_ts': None,
-                'waiting_for_pullback': False,
-                'signal_candle_close': None,
-                'signal_direction': None,
-                'signal_volume': 0
+    async def fetch_all_tickers(self):
+        try:
+            tickers = await self.exchange.fetch_tickers()
+            return tickers
+        except Exception as e:
+            logger.error(f"Ошибка fetch_tickers: {e}")
+            return {}
+
+    async def is_suitable_symbol(self, symbol, tickers):
+        try:
+            ticker = tickers.get(symbol)
+            if not ticker:
+                return False
+            volume_24h = ticker.get('quoteVolume', 0)
+            if volume_24h < self.config.get('min_volume_24h', 0):
+                return False
+            high = ticker.get('high', 0)
+            low = ticker.get('low', 0)
+            if low > 0:
+                volatility = (high - low) / low * 100
+                if volatility > self.config.get('volatility_filter_percent', 100):
+                    return False
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка в is_suitable_symbol для {symbol}: {e}")
+            return False
+
+    async def load_market_list(self):
+        await self.exchange.load_markets()
+        candidates = [
+            symbol
+            for symbol, market in self.exchange.markets.items()
+            if market['swap']
+               and market['quote'] == 'USDT'
+               and symbol.count('/') == 1
+               and not symbol.startswith(('NCFX', 'NCCO', 'NCSI', 'NCSK'))
+        ]
+        logger.info(f"Найдено {len(candidates)} кандидатов для сигнального бота")
+
+        tickers = await self.fetch_all_tickers()
+        self.all_symbols = []
+        for symbol in candidates:
+            if symbol in self.blacklist:
+                continue
+            if await self.is_suitable_symbol(symbol, tickers):
+                self.all_symbols.append(symbol)
+        logger.info(f"Осталось {len(self.all_symbols)} монет после фильтра")
+
+    def period_hours(self, timeframe):
+        mapping = {'1m': 1/60, '3m': 3/60, '5m': 5/60, '15m': 15/60, '1h': 1,
+                   '4h': 4, '6h': 6, '12h': 12, '1d': 24}
+        return mapping.get(timeframe, 6)
+
+    def is_mid_candle(self, df, timeframe):
+        if len(df) < 1:
+            return False
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        last_ts = df['timestamp'].iloc[-1]
+        freq_hours = self.period_hours(timeframe)
+        elapsed_seconds = (now - last_ts).total_seconds()
+        elapsed_hours = elapsed_seconds / 3600
+        remaining_hours = freq_hours - elapsed_hours
+        half_period = freq_hours / 2
+        return remaining_hours > half_period
+
+    def min_pullback_percent(self):
+        return self.config['signal_params'].get('min_pullback_percent', 0.2)
+
+    async def generate_signal(self, symbol, timeframe, limit=20):
+        df = await self.get_market_data(symbol, timeframe, limit=limit)
+        if df is None or len(df) < 3:
+            return None
+
+        # Проверка времени (актуально для свечи, на которой будем входить – откатной)
+        # Здесь проверяем текущую свечу (последнюю)
+        if not self.is_mid_candle(df, timeframe):
+            return None
+
+        ha_df = self.calculate_heiken_ashi(df)
+        if len(ha_df) < 3:
+            return None
+
+        # Индексы:
+        # -2: сигнальная свеча (закрыта)
+        # -1: откатная свеча (текущая, незакрытая)
+        sig = ha_df.iloc[-2]
+        pull = ha_df.iloc[-1]
+
+        sig_color = sig['ha_color']
+        sig_low = sig['low']
+        sig_high = sig['high']
+        sig_ha_open = sig['ha_open']
+
+        # Определяем направление сигнала
+        signal_type = None
+        reason = ""
+
+        # LONG: сигнальная свеча зелёная (предыдущая была красной – не проверяем, но можем добавить)
+        #      и откат вниз: текущая свеча имеет low ниже, чем HA_Open сигнальной?
+        # По классике: откат вниз на следующей свече – проверяем pull['low'] < sig_ha_open
+        if sig_color == 'green':
+            pull_low = pull['low']
+            if pull_low < sig_ha_open:
+                pullback_percent = (sig_ha_open - pull_low) / sig_ha_open * 100
+                if pullback_percent >= self.min_pullback_percent():
+                    signal_type = 'LONG'
+                    reason = (f"Reversal: зелёная сигнальная, откат вниз на {pullback_percent:.2f}%")
+        # SHORT: сигнальная свеча красная, откат вверх
+        elif sig_color == 'red':
+            pull_high = pull['high']
+            if pull_high > sig_ha_open:
+                pullback_percent = (pull_high - sig_ha_open) / sig_ha_open * 100
+                if pullback_percent >= self.min_pullback_percent():
+                    signal_type = 'SHORT'
+                    reason = (f"Reversal: красная сигнальная, откат вверх на {pullback_percent:.2f}%")
+
+        if signal_type:
+            price = sig['close']  # вход по цене закрытия сигнальной свечи
+            return {
+                'type': signal_type,
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'price': price,
+                'reason': reason
             }
-        state = self.signal_state[symbol]
 
-        if current_ts != state['last_candle_ts']:
-            state['last_candle_ts'] = current_ts
-            prev2 = df['ha_color'].iloc[-3]
-            prev1 = df['ha_color'].iloc[-2]
-            sig_candle = df.iloc[-2]
-            if prev2 == 'red' and prev1 == 'green':
-                state['waiting_for_pullback'] = True
-                state['signal_direction'] = 'LONG'
-                state['signal_candle_close'] = sig_candle['close']
-                state['signal_volume'] = sig_candle['volume']
-                logger.info(f"{symbol}: сигнал LONG, ждём отката вниз")
-            elif prev2 == 'green' and prev1 == 'red':
-                state['waiting_for_pullback'] = True
-                state['signal_direction'] = 'SHORT'
-                state['signal_candle_close'] = sig_candle['close']
-                state['signal_volume'] = sig_candle['volume']
-                logger.info(f"{symbol}: сигнал SHORT, ждём отката вверх")
-            else:
-                state['waiting_for_pullback'] = False
+        return None
 
-        if state['waiting_for_pullback']:
-            curr_candle = df.iloc[-1]
-            curr_ha_open = df['ha_open'].iloc[-1]
-            min_pullback = self.config['trade_params']['min_pullback_percent'] / 100.0
-            if state['signal_direction'] == 'LONG':
-                target_low = min(curr_ha_open, state['signal_candle_close']) * (1 - min_pullback)
-                if curr_candle['low'] <= target_low:
-                    await self.open_position(symbol, 'LONG', curr_candle['close'], curr_candle['volume'])
-                    state['waiting_for_pullback'] = False
-            elif state['signal_direction'] == 'SHORT':
-                target_high = max(curr_ha_open, state['signal_candle_close']) * (1 + min_pullback)
-                if curr_candle['high'] >= target_high:
-                    await self.open_position(symbol, 'SHORT', curr_candle['close'], curr_candle['volume'])
-                    state['waiting_for_pullback'] = False
+    async def scan_for_signals(self):
+        await self.load_market_list()
+        timeframes = self.config.get('timeframes', ['6h', '12h'])
+
+        while True:
+            logger.info(f"🔄 Сканирую {len(self.all_symbols)} монет по таймфреймам: {timeframes}")
+
+            for symbol in self.all_symbols:
+                if symbol in self.blacklist:
+                    continue
+
+                for tf in timeframes:
+                    key = f"{symbol}_{tf}"
+                    try:
+                        signal = await self.generate_signal(symbol, tf)
+                        if not signal:
+                            continue
+
+                        # Защита от дублей (одно направление на одной монете в течение 2 часов)
+                        last_signal = self.sent_signals.get(key)
+                        if last_signal and last_signal['type'] == signal['type']:
+                            time_diff = (datetime.utcnow() - last_signal['ts']).total_seconds()
+                            if time_diff < 7200:  # 2 часа
+                                logger.debug(f"Дубль сигнала {key} ({signal['type']}) – пропущен")
+                                continue
+
+                        self.sent_signals[key] = {
+                            'type': signal['type'],
+                            'ts': datetime.utcnow()
+                        }
+
+                        logger.info(f"Сигнал {signal['type']} на {symbol} {tf}: {signal['price']:.5f}")
+                        await self.send_telegram_signal(
+                            symbol=signal['symbol'],
+                            signal_type=signal['type'],
+                            timeframe=signal['timeframe'],
+                            price=signal['price'],
+                            reason=signal['reason']
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации сигнала {symbol} {tf}: {e}")
+
+            # Очистка старых записей sent_signals (старше 24 часов)
+            now = datetime.utcnow()
+            to_remove = [k for k, v in self.sent_signals.items() if (now - v['ts']).total_seconds() > 86400]
+            for k in to_remove:
+                del self.sent_signals[k]
+
+            logger.info("Жду 30 минут до следующего цикла...")
+            await asyncio.sleep(1800)
 
     async def run(self):
-        await self.load_markets()
-        asyncio.create_task(self.monitor_positions())
-        balance = await self.get_balance()
-        await self.send_telegram(
-            f"🚀 БОТ ЗАПУЩЕН (АГРЕССИВНЫЙ РЕЖИМ)\n"
-            f"Таймфрейм: {self.config['timeframe']}\n"
-            f"Сумма сделки: {self.config['trade_params']['fixed_trade_amount']} USDT\n"
-            f"SL/TP: 50%\n"
-            f"Макс. позиций: {self.config['max_positions']}\n"
-            f"Баланс: {balance:.2f} USDT\n"
-            f"Цель: $4/час"
-        )
-        while True:
-            for symbol in self.all_symbols:
-                try:
-                    await self.process_symbol(symbol)
-                except Exception as e:
-                    logger.error(f"Ошибка {symbol}: {e}")
-                await asyncio.sleep(0.5)
-            await asyncio.sleep(30)  # 30 секунд между циклами для 5-минутного ТФ
+        try:
+            balance = await self.exchange.fetch_balance()
+            usdt_free = balance['USDT']['free']
+            logger.info(f"Баланс: {usdt_free:.2f} USDT (только сигналы)")
+            await self.send_telegram_signal("BOT", "СТАРТ", "LOG", 0.0,
+                "Старт сигнального бота Heiken Ashi (6h/12h, откат на следующей свече)")
+        except Exception as e:
+            logger.error(f"Ошибка баланса: {e}")
+            await self.send_telegram_signal("BOT", "СТАРТ", "LOG", 0.0,
+                "Сигнальный бот запущен (без баланса)")
+
+        await self.scan_for_signals()
 
     async def close(self):
         await self.exchange.close()
 
+
 async def main():
     config = load_config()
-    bot = TradingBot(config)
+    bot = SignalBot(config)
     try:
         await bot.run()
     finally:
         await bot.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
